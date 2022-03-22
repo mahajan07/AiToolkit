@@ -15,3 +15,8 @@ def calculate_time(s_time):
         minutes -= 60
 
     print(f'Cell Executed in {hours}h {minutes}m {seconds}s')
+
+# Profile report of your data
+df = pd.read_csv(datafile_you_want_to_use, nrows=_choose_)
+profile = pandas_profiling.ProfileReport(df_temp, title="Profile Report", minimal=True, progress_bar=False)
+profile.to_notebook_iframe()
