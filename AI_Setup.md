@@ -109,10 +109,5 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ---
 
 ### 🎉 Ready to Build?
-
-Now you’re armed with OpenAI, Langchain, Claude, and LLaMA setups — time to create some magic! 🧠✨
-
----
-
 Happy coding! 💻🔥
 
