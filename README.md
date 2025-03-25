@@ -1,2 +1,3 @@
-# Mini_Code_Structures
+# Ready to use code snips
+
 Small chunks of scripts
