@@ -79,7 +79,6 @@ response = client.completions.create(
 
 print(response.completion)
 ```
-
 ---
 
 ## 🦙 4. LLaMA Setup (Meta’s model)
