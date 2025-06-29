@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 st.title("AI Customer Support Agent with Memory 🛒")
 st.caption("Chat with a customer support assistant who remembers your past interactions.")
 
-# Set the OpenAI API key
+# Set the OpenAI API key 
 openai_api_key = st.text_input("Enter OpenAI API Key", type="password")
 
 if openai_api_key:
