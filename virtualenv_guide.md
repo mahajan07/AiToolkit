@@ -26,3 +26,25 @@ source .venv/bin/activate
 
 # Deactivate virtual environment
 deactivate
+---
+
+## 📦 2. Install Packages & Manage Dependencies
+```bash
+# Install dependencies from requirements.txt
+pip install -r requirements.txt
+
+# Save installed packages to requirements.txt
+pip freeze > requirements.txt
+
+# Upgrade pip
+python -m pip install --upgrade pip
+
+# Show package version
+pip show package_name
+
+# List installed packages
+pip list
+
+# Uninstall a package
+pip uninstall package_name
+
