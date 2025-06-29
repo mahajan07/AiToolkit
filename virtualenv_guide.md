@@ -27,7 +27,7 @@ source .venv/bin/activate
 # Deactivate virtual environment
 deactivate
 ---
-
+```
 ## 📦 2. Install Packages & Manage Dependencies
 ```bash
 # Install dependencies from requirements.txt
@@ -47,4 +47,4 @@ pip list
 
 # Uninstall a package
 pip uninstall package_name
-
+```
