@@ -10,7 +10,7 @@ First, install the OpenAI library:
 
 ```bash
 pip install openai
-```
+``` 
 
 Basic usage example:
 
