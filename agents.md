@@ -7,7 +7,7 @@ Semantic models serve as the foundation for deriving actionable insights from co
 
 Before designing a semantic model:
 
-Define the business problem clearly. (e.g., Membership growth in cards, delinquency trends in loans, servicing channel efficiency).
+Define the business problem clearly. (e.g., Membership growth in cards, delinquency trends in loans, servici ng channel efficiency).
 
 Identify key entities. In consumer banking these often include: members, accounts, applications, products, services, credit scores, and transactions.
 
