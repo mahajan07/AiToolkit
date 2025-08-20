@@ -2,7 +2,6 @@ Best Practices for Building Semantic Models in Consumer Banking (Cards, Loans, A
 1. Introduction
 
 Semantic models serve as the foundation for deriving actionable insights from consumer banking data. In this document, we outline a structured approach to building semantic models using Snowflake and Cortex Analyst, with specific application to membership, cards, loans, applications, originations, and collections. The goal is to establish repeatable standards that ensure scalability, performance, and clarity for end users across analytics and business teams.
-
 2. Strategic Approach to Building Semantic Models
 2.1 Think Before You Build
 
