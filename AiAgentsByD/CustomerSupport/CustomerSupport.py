@@ -202,4 +202,3 @@ if openai_api_key:
 else:
     st.warning("Please enter your OpenAI API key to use the customer support agent.")
 
-https://github.com/Shubhamsaboo/awesome-llm-apps/blob/main/advanced_ai_agents/single_agent_apps/ai_customer_support_agent/customer_support_agent.py
