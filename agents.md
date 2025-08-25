@@ -8,3 +8,36 @@
 
 
 
+⏳ Pending with 🔄 In Progress or ✅ Complete
+| **Stage**                       | **Task**                                 | **Owner**      | **Status** | **Next Step**                   |
+| ------------------------------- | ---------------------------------------- | -------------- | ---------- | ------------------------------- |
+| Requirement Gathering           | Identify stakeholders                    | BI Lead        | ⏳ Pending  | Conduct requirement workshops   |
+| Requirement Gathering           | Conduct requirement workshops            | Analyst        | ⏳ Pending  | Document analytics needs        |
+| Requirement Gathering           | Document business analytics needs        | BI Lead        | ⏳ Pending  | Validate scope                  |
+| Requirement Gathering           | Validate scope with stakeholders         | Stakeholders   | ⏳ Pending  | Move to Data Sourcing           |
+| Data Sourcing & STTM/Script Dev | Identify data sources                    | Analyst        | ⏳ Pending  | Gather metadata                 |
+| Data Sourcing & STTM/Script Dev | Gather metadata                          | Analyst        | ⏳ Pending  | Document horizon                |
+| Data Sourcing & STTM/Script Dev | Document time/volume horizon             | BI Lead        | ⏳ Pending  | Build STTM                      |
+| Data Sourcing & STTM/Script Dev | Build STTM and scripts                   | Analyst        | ⏳ Pending  | Standardize attributes          |
+| Standardization & Alignment     | Align attributes across channels         | Channel Leads  | ⏳ Pending  | Standardize naming conventions  |
+| Standardization & Alignment     | Standardize naming conventions           | Channel Leads  | ⏳ Pending  | Validate recon reports          |
+| Standardization & Alignment     | Validate recon reports                   | Channel Leads  | ⏳ Pending  | Move to Data Engineering        |
+| Data Engineering & Quality      | Deploy scripts to PROD/Sandbox           | Data Engineer  | ⏳ Pending  | Perform data quality validation |
+| Data Engineering & Quality      | Perform data quality validation          | Data Engineer  | ⏳ Pending  | Write to BI Datamart            |
+| Data Engineering & Quality      | Write validated tables to BI Datamart    | Data Engineer  | ⏳ Pending  | Create Semantic Models          |
+| Semantic Model Creation         | Build Semantic Models in Cortex Analyst  | Cortex Analyst | ⏳ Pending  | Align with glossary             |
+| Semantic Model Creation         | Align with glossary and job aids         | Cortex Analyst | ⏳ Pending  | Document semantic layers        |
+| Semantic Model Creation         | Document semantic layers                 | Cortex Analyst | ⏳ Pending  | Train semantic models           |
+| Semantic Model Training         | Train with custom instructions           | Cortex Analyst | ⏳ Pending  | Map logical views               |
+| Semantic Model Training         | Map logical views                        | Cortex Analyst | ⏳ Pending  | Validate with queries           |
+| Semantic Model Training         | Validate with tested queries             | Cortex Analyst | ⏳ Pending  | Ensure attribute management     |
+| Semantic Model Training         | Ensure attribute management              | Cortex Analyst | ⏳ Pending  | Move to Integration             |
+| Integration (Snowflake)         | Add Analyst to Snowflake Agent           | BI Lead        | ⏳ Pending  | Deploy Agent                    |
+| Integration (Snowflake)         | Deploy Agent into Snowflake Intelligence | BI Lead        | ⏳ Pending  | Demo to stakeholders            |
+| Integration (Snowflake)         | Demo to stakeholders                     | BI Lead        | ⏳ Pending  | Onboard stakeholders            |
+| Stakeholder Onboarding          | Conduct end-user training                | Trainer        | ⏳ Pending  | Provide documentation           |
+| Stakeholder Onboarding          | Provide documentation                    | BI Lead        | ⏳ Pending  | Gather feedback                 |
+| Stakeholder Onboarding          | Gather feedback                          | Stakeholders   | ⏳ Pending  | Move to Monitoring              |
+| Monitoring & CI/CD Loop         | Set up monitoring                        | BI Lead        | ⏳ Pending  | Automate CI/CD                  |
+| Monitoring & CI/CD Loop         | Automate CI/CD                           | DevOps         | ⏳ Pending  | Continuous feedback             |
+| Monitoring & CI/CD Loop         | Incorporate continuous feedback          | BI Lead        | ⏳ Pending  | Close loop                      |
