@@ -1,71 +1,57 @@
-# Semantic Model UML
+title Semantic Model Relationships
 
-This is the unified UML diagram for our fact-driven semantic model.
+participant "MEMBER AGENT (Semantic Model)" as HUB
 
-```plantuml
-@startuml
-skinparam packageStyle rectangle
-skinparam linetype ortho
-hide circle
+participant "CARDS PORTFOLIO MASTER" as CARDS
+participant "DEPOSITS PORTFOLIO MASTER" as DEPOSITS
+participant "CONSUMER LOANS PORTFOLIO MASTER" as LOANS
+participant "APPLICATIONS & ORIGINATION MASTER" as APPS
+participant "SERVICING & COLLECTIONS MASTER" as SERVICING
 
-package "Semantic Hub" {
-  class "MEMBER AGENT\n(Semantic Model)" as MEMBER_AGENT <<Hub>>
-}
+participant "CARDS TRANSACTION MODEL" as CARDS_TXN
+participant "DEPOSITS TRANSACTION MODEL" as DEPOSITS_TXN
+participant "DAILY DATA MODEL" as DAILY_DATA
+participant "REWARDS LEDGER" as REWARDS
+participant "CAMPAIGNS (Cards)" as CARDS_CAMP
+participant "CAMPAIGNS (Deposits)" as DEPOSITS_CAMP
+participant "CAMPAIGNS (Loans)" as LOANS_CAMP
 
-package "Portfolio Masters" {
-  class "CARDS PORTFOLIO MASTER" as CARDS_PM
-  class "DEPOSITS PORTFOLIO MASTER" as DEPOSITS_PM
-  class "CONSUMER LOANS PORTFOLIO MASTER" as LOANS_PM
-  class "APPLICATIONS & ORIGINATION MASTER" as APPS_PM
-  class "SERVICING & COLLECTIONS MASTER" as SERVICING_PM
-}
+participant "RISK & BUREAU SNAPSHOT" as RISK_BUREAU
+participant "BRANCH LEVEL ORIGINATION" as BRANCH_ORIG
 
-package "Domain Inputs" {
-  class "CARDS TRANSACTION MODEL" as CARDS_TXN
-  class "DEPOSITS TRANSACTION MODEL" as DEPOSITS_TXN
-  class "DAILY DATA MODEL" as DAILY_DATA
-  class "REWARDS LEDGER" as REWARDS
-  class "CAMPAIGNS (Cards)" as CARDS_CAMP
-  class "CAMPAIGNS (Deposits)" as DEPOSITS_CAMP
-  class "CAMPAIGNS (Loans)" as LOANS_CAMP
-}
+participant "ATOMIC - D SNAPS" as ATOMIC_D
+participant "PERIODIC - M SNAPS" as PERIODIC_M
+participant "AGENTS / SEMANTIC - MONTHLY SNAPS" as AGENT_MONTHLY
 
-package "Risk & Origination" {
-  class "RISK & BUREAU SNAPSHOT" as RISK_BUREAU
-  class "BRANCH LEVEL ORIGINATION" as BRANCH_ORIG
-}
+' Hub connections
+HUB -> CARDS : member_accounts
+HUB -> DEPOSITS : member_accounts
+HUB -> LOANS : member_accounts
+HUB -> APPS : applications
+HUB -> SERVICING : servicing_cases
 
-package "Snapshots" {
-  class "ATOMIC - D SNAPS" as ATOMIC_D
-  class "PERIODIC - M SNAPS" as PERIODIC_M
-  class "AGENTS / SEMANTIC - MONTHLY SNAPS" as AGENT_MONTHLY
-}
+' Cards branch
+CARDS_TXN -> CARDS : rolls up
+REWARDS -> CARDS : enriches
+CARDS_CAMP -> CARDS : influences
 
-MEMBER_AGENT -- CARDS_PM
-MEMBER_AGENT -- DEPOSITS_PM
-MEMBER_AGENT -- LOANS_PM
-MEMBER_AGENT -- APPS_PM
-MEMBER_AGENT -- SERVICING_PM
+' Deposits branch
+DEPOSITS_TXN -> DEPOSITS : rolls up
+DEPOSITS_CAMP -> DEPOSITS : influences
 
-CARDS_TXN --> CARDS_PM : rolls up
-REWARDS --> CARDS_PM : enriches
-CARDS_CAMP --> CARDS_PM : influences
+' Loans branch
+DAILY_DATA -> LOANS : rolls up
+LOANS_CAMP -> LOANS : influences
 
-DEPOSITS_TXN --> DEPOSITS_PM : rolls up
-DEPOSITS_CAMP --> DEPOSITS_PM : influences
+' Applications branch
+RISK_BUREAU -> APPS : enriches
+BRANCH_ORIG -> APPS : operational feed
 
-DAILY_DATA --> LOANS_PM : rolls up
-LOANS_CAMP --> LOANS_PM : influences
-
-RISK_BUREAU --> APPS_PM : enriches
-BRANCH_ORIG --> APPS_PM : operational feed
-
-ATOMIC_D --> CARDS_PM
-ATOMIC_D --> DEPOSITS_PM
-ATOMIC_D --> LOANS_PM
-ATOMIC_D --> SERVICING_PM
-PERIODIC_M --> APPS_PM
-PERIODIC_M --> MEMBER_AGENT
-AGENT_MONTHLY --> MEMBER_AGENT
-
-@enduml
+' Snapshots
+ATOMIC_D -> CARDS : feeds
+ATOMIC_D -> DEPOSITS : feeds
+ATOMIC_D -> LOANS : feeds
+ATOMIC_D -> SERVICING : feeds
+PERIODIC_M -> APPS : feeds
+PERIODIC_M -> HUB : feeds
+AGENT_MONTHLY -> HUB : feeds
