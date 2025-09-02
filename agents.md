@@ -1,54 +1,104 @@
-WITH vd_tokens AS (
-  SELECT
-    UPPER(BRAND) AS VENDOR,
-    ARRAY_AGG(DISTINCT VALUE) AS TOKENS
-  FROM VENDOR_DIRECTORY,
-       LATERAL SPLIT_TO_TABLE(UPPER(BRAND), ' ')
-  GROUP BY 1
-),
-tx_tokens AS (
-  SELECT
-    DAF_MERCH_NAME,
-    DAF_MERCH_CITY,
-    ARRAY_AGG(DISTINCT VALUE) AS TOKENS
-  FROM TRANSACTIONS,
-       LATERAL SPLIT_TO_TABLE(UPPER(DAF_MERCH_NAME), ' ')
-  WHERE UPPER(DAF_MERCH_CITY) LIKE '%TYSON%'
-  GROUP BY 1,2
-),
-pairs AS (
-  SELECT
-    v.VENDOR, t.DAF_MERCH_NAME, t.DAF_MERCH_CITY, v.TOKENS AS V_TOK, t.TOKENS AS T_TOK
-  FROM vd_tokens v
-  JOIN tx_tokens t ON TRUE
-),
-intersections AS (
-  SELECT
-    p.VENDOR, p.DAF_MERCH_NAME, p.DAF_MERCH_CITY,
-    COUNT(DISTINCT vt.VALUE) AS inter_cnt
-  FROM pairs p,
-       LATERAL FLATTEN(INPUT => p.V_TOK) vt,
-       LATERAL FLATTEN(INPUT => p.T_TOK) tt
-  WHERE vt.VALUE = tt.VALUE
-  GROUP BY 1,2,3
-),
-sizes AS (
-  SELECT
-    p.VENDOR, p.DAF_MERCH_NAME, p.DAF_MERCH_CITY,
-    (SELECT COUNT(DISTINCT VALUE) FROM LATERAL FLATTEN(INPUT => p.V_TOK)) AS v_size,
-    (SELECT COUNT(DISTINCT VALUE) FROM LATERAL FLATTEN(INPUT => p.T_TOK)) AS t_size
-  FROM pairs p
+# Snowpark: character-based fuzzy match, no location filters
+from snowflake.snowpark.functions import (
+    col, upper, regexp_replace, trim, length, greatest, lit,
+    call_function, when
 )
-SELECT
-  s.VENDOR,
-  s.DAF_MERCH_NAME AS MATCHED_MERCHANT,
-  s.DAF_MERCH_CITY AS MATCHED_CITY,
-  i.inter_cnt,
-  (s.v_size + s.t_size - i.inter_cnt) AS union_cnt,
-  (i.inter_cnt * 1.0) / NULLIF(s.v_size + s.t_size - i.inter_cnt, 0) AS jaccard
-FROM sizes s
-LEFT JOIN intersections i
-  ON s.VENDOR = i.VENDOR AND s.DAF_MERCH_NAME = i.DAF_MERCH_NAME
-QUALIFY ROW_NUMBER() OVER (PARTITION BY s.VENDOR ORDER BY jaccard DESC) = 1
--- WHERE jaccard >= 0.55
-ORDER BY jaccard DESC;
+from snowflake.snowpark.window import Window
+
+# ---- configure your sources ----
+DIR_TBL = '"SBOX_CONSUMERBANKING_DB"."DEPOSITS_CARDS_CHNL_PROD"."TYSONS_STORE_DIR_DM"'
+DIR_COL = "BRANDS"                     # brand names column
+
+TX_TBL  = "PTX_DB.DBO.RAW_SCH.AUTHFILE"
+TX_COL  = "DAF_MERCH_NAME"             # merchant names column
+TX_FILTER = "PERIODODATE >= 20250101"  # optional; or set to None
+
+# weights / thresholds
+JW_WT = 0.6         # weight for Jaro–Winkler (character similarity)
+LEV_WT = 0.4        # weight for normalized Levenshtein similarity
+HIGH = 0.92         # high-confidence if combined score ≥ HIGH
+MED  = 0.86         # medium-confidence if combined score ≥ MED
+
+# ---- helpers (character-only normalization) ----
+def char_only(expr):
+    # Uppercase and keep letters only; collapse whitespace (very light cleaning)
+    s = upper(expr)
+    s = regexp_replace(s, r'\s+', '')            # drop spaces
+    s = regexp_replace(s, r'[^A-Z]', '')         # keep only A–Z
+    return s
+
+def prefix(expr, n=3):
+    return expr.substr(lit(1), lit(n))
+
+# ---- load & prepare ----
+vd = session.table(DIR_TBL).select(
+        col(DIR_COL).alias("BRAND_RAW")
+    ).with_columns({
+        "BRAND_CHARS": char_only(col("BRAND_RAW")),
+    }).with_column("PFX", prefix(col("BRAND_CHARS"), 3)) \
+     .filter(length(col("BRAND_CHARS")) > 0)
+
+tx = session.table(TX_TBL).select(
+        col(TX_COL).alias("MERCH_RAW")
+    ).with_columns({
+        "MERCH_CHARS": char_only(col("MERCH_RAW")),
+    }).with_column("PFX", prefix(col("MERCH_CHARS"), 3)) \
+     .filter(length(col("MERCH_CHARS")) > 0)
+
+if TX_FILTER:
+    tx = tx.filter(TX_FILTER)
+
+# ---- candidate generation (by 3-letter character prefix; fallback to 1-2 if short) ----
+candidates = vd.join(tx, vd["PFX"] == tx["PFX"], how="inner")
+# optional: widen for short names
+short_v = vd.filter(length(col("BRAND_CHARS")) < 3) \
+            .join(tx, prefix(col("BRAND_CHARS"), 1) == prefix(col("MERCH_CHARS"), 1), how="inner")
+candidates = candidates.union_all(short_v).distinct()
+
+# ---- character-based similarities ----
+jw = call_function("JARO_WINKLER_SIMILARITY", col("BRAND_CHARS"), col("MERCH_CHARS"))
+lev = call_function("EDITDISTANCE", col("BRAND_CHARS"), col("MERCH_CHARS"))
+den = greatest(length(col("BRAND_CHARS")), length(col("MERCH_CHARS")))
+lev_sim = (lit(1.0) - (lev / call_function("NULLIF", den, lit(0))))
+
+scored = candidates.with_columns({
+    "JW": jw,
+    "LEV_SIM": lev_sim,
+    "SCORE": JW_WT * jw + LEV_WT * lev_sim
+})
+
+# ---- pick best merchant per brand ----
+w = Window.partition_by("BRAND_RAW").order_by(col("SCORE").desc())
+best = scored.with_column("RN", call_function("ROW_NUMBER").over(w)) \
+             .filter(col("RN") == 1) \
+             .drop("RN")
+
+# ---- confidence bands and exists flag ----
+best = best.with_column(
+    "CONFIDENCE",
+    when(col("SCORE") >= lit(HIGH), lit("HIGH"))
+     .when(col("SCORE") >= lit(MED),  lit("MEDIUM"))
+     .otherwise(lit("LOW"))
+).with_column(
+    "EXISTS_IN_TX", (col("SCORE") >= lit(MED)).cast("int")
+)
+
+result = best.select(
+    col("BRAND_RAW").alias("BRAND"),
+    col("MERCH_RAW").alias("BEST_MATCH_MERCHANT"),
+    col("JW").alias("jw_char_sim"),
+    col("LEV_SIM").alias("lev_char_sim"),
+    col("SCORE").alias("combined_score"),
+    col("CONFIDENCE"),
+    col("EXISTS_IN_TX")
+)
+
+# coverage metric
+metrics = result.agg(
+    call_function("COUNT_IF", col("EXISTS_IN_TX") == lit(1)).alias("matched_brands"),
+    call_function("COUNT", lit(1)).alias("total_brands")
+).with_column("coverage_pct", (col("matched_brands")*100.0 / col("total_brands")))
+
+result.show()     # per-brand best match with scores and confidence
+metrics.show()    # overall coverage
+# result.write.save_as_table('ANALYTICS.BRAND_MATCHES_CHAR', mode='overwrite')
