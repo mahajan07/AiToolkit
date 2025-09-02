@@ -1,104 +1,131 @@
-# Snowpark: character-based fuzzy match, no location filters
-from snowflake.snowpark.functions import (
-    col, upper, regexp_replace, trim, length, greatest, lit,
-    call_function, when
+Totally—Cortex can do this two solid ways. Below are copy-paste Snowflake SQL snippets that use Cortex the right way (no city/ZIP). They fix the syntax issues in your screenshot and give you “Abercrombie & Fitch ↔ A&F ↔ Fitch” style matches.
+
+
+---
+
+1) Embedding match (recommended)
+
+Use Cortex embeddings to vectorize every brand and every merchant name, then take the nearest merchant per brand by cosine similarity. This naturally catches abbreviations like A&F.
+
+-- Choose a Snowflake-hosted embedding model
+SET MODEL := 'snowflake-arctic-embed-m-v1.5';
+
+-- Brands → embeddings
+CREATE OR REPLACE TEMP TABLE BRAND_EMB AS
+SELECT
+  BRANDS                                AS BRAND_RAW,
+  AI_EMBED($MODEL, BRANDS)              AS BRAND_VEC
+FROM "SBOX_CONSUMERBANKING_DB"."DEPOSITS_CARDS_CHNL_PROD"."TYSONS_STORE_DIR_DM"
+WHERE BRANDS IS NOT NULL;
+
+-- Merchants → embeddings
+CREATE OR REPLACE TEMP TABLE MERCH_EMB AS
+SELECT
+  DAF_MERCH_NAME                        AS MERCH_RAW,
+  AI_EMBED($MODEL, DAF_MERCH_NAME)      AS MERCH_VEC
+FROM PTX_DB.DBO.RAW_SCH.AUTHFILE
+WHERE DAF_MERCH_NAME IS NOT NULL;
+
+-- (Optional) cheap candidate reducer so we don’t do a full cartesian
+WITH B AS (
+  SELECT BRAND_RAW, BRAND_VEC, SUBSTR(UPPER(BRAND_RAW),1,1) AS K FROM BRAND_EMB
+),
+M AS (
+  SELECT MERCH_RAW, MERCH_VEC, SUBSTR(UPPER(MERCH_RAW),1,1) AS K FROM MERCH_EMB
 )
-from snowflake.snowpark.window import Window
+SELECT
+  B.BRAND_RAW,
+  M.MERCH_RAW,
+  VECTOR_COSINE_SIMILARITY(B.BRAND_VEC, M.MERCH_VEC) AS COS_SIM
+FROM B JOIN M USING (K)
+QUALIFY ROW_NUMBER() OVER (PARTITION BY B.BRAND_RAW ORDER BY COS_SIM DESC) = 1
+ORDER BY COS_SIM DESC;
 
-# ---- configure your sources ----
-DIR_TBL = '"SBOX_CONSUMERBANKING_DB"."DEPOSITS_CARDS_CHNL_PROD"."TYSONS_STORE_DIR_DM"'
-DIR_COL = "BRANDS"                     # brand names column
+Confidence bands (tweak after a spot-check):
 
-TX_TBL  = "PTX_DB.DBO.RAW_SCH.AUTHFILE"
-TX_COL  = "DAF_MERCH_NAME"             # merchant names column
-TX_FILTER = "PERIODODATE >= 20250101"  # optional; or set to None
+SELECT
+  BRAND_RAW AS BRAND,
+  MERCH_RAW AS BEST_MATCH_MERCHANT,
+  COS_SIM,
+  CASE WHEN COS_SIM >= 0.90 THEN 'HIGH'
+       WHEN COS_SIM >= 0.85 THEN 'MEDIUM'
+       ELSE 'LOW' END AS CONFIDENCE
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
 
-# weights / thresholds
-JW_WT = 0.6         # weight for Jaro–Winkler (character similarity)
-LEV_WT = 0.4        # weight for normalized Levenshtein similarity
-HIGH = 0.92         # high-confidence if combined score ≥ HIGH
-MED  = 0.86         # medium-confidence if combined score ≥ MED
 
-# ---- helpers (character-only normalization) ----
-def char_only(expr):
-    # Uppercase and keep letters only; collapse whitespace (very light cleaning)
-    s = upper(expr)
-    s = regexp_replace(s, r'\s+', '')            # drop spaces
-    s = regexp_replace(s, r'[^A-Z]', '')         # keep only A–Z
-    return s
+---
 
-def prefix(expr, n=3):
-    return expr.substr(lit(1), lit(n))
+2) LLM canonicalization + similarity (nice complement)
 
-# ---- load & prepare ----
-vd = session.table(DIR_TBL).select(
-        col(DIR_COL).alias("BRAND_RAW")
-    ).with_columns({
-        "BRAND_CHARS": char_only(col("BRAND_RAW")),
-    }).with_column("PFX", prefix(col("BRAND_CHARS"), 3)) \
-     .filter(length(col("BRAND_CHARS")) > 0)
+Have Cortex extract just the brand from each messy merchant string (drop store numbers, symbols), then fuzzy-match to your directory. This fixes cases like “APPLE STORE #R010” → “APPLE” before matching.
 
-tx = session.table(TX_TBL).select(
-        col(TX_COL).alias("MERCH_RAW")
-    ).with_columns({
-        "MERCH_CHARS": char_only(col("MERCH_RAW")),
-    }).with_column("PFX", prefix(col("MERCH_CHARS"), 3)) \
-     .filter(length(col("MERCH_CHARS")) > 0)
+> In SQL, call the scalar function SNOWFLAKE.CORTEX.COMPLETE with (model, prompt_text)
+or SNOWFLAKE.CORTEX.EXTRACT_ANSWER(question, context).
+Your earlier syntax error happened because WHERE cannot contain window functions and because of minor punctuation around the function call.
 
-if TX_FILTER:
-    tx = tx.filter(TX_FILTER)
 
-# ---- candidate generation (by 3-letter character prefix; fallback to 1-2 if short) ----
-candidates = vd.join(tx, vd["PFX"] == tx["PFX"], how="inner")
-# optional: widen for short names
-short_v = vd.filter(length(col("BRAND_CHARS")) < 3) \
-            .join(tx, prefix(col("BRAND_CHARS"), 1) == prefix(col("MERCH_CHARS"), 1), how="inner")
-candidates = candidates.union_all(short_v).distinct()
 
-# ---- character-based similarities ----
-jw = call_function("JARO_WINKLER_SIMILARITY", col("BRAND_CHARS"), col("MERCH_CHARS"))
-lev = call_function("EDITDISTANCE", col("BRAND_CHARS"), col("MERCH_CHARS"))
-den = greatest(length(col("BRAND_CHARS")), length(col("MERCH_CHARS")))
-lev_sim = (lit(1.0) - (lev / call_function("NULLIF", den, lit(0))))
+-- 2a) Canonicalize merchant → brand-ish name with LLM
+CREATE OR REPLACE TEMP TABLE MERCH_CANON AS
+SELECT
+  DAF_MERCH_NAME AS MERCH_RAW,
+  SNOWFLAKE.CORTEX.EXTRACT_ANSWER(
+    'Give only the merchant brand name (no store #, location, or descriptors). Examples: "A&F"→"ABERCROMBIE & FITCH", "APPLE STORE #R010"→"APPLE", "CMX CINEMAS"→"CMX".',
+    DAF_MERCH_NAME
+  ) AS MERCH_BRAND
+FROM PTX_DB.DBO.RAW_SCH.AUTHFILE
+WHERE DAF_MERCH_NAME IS NOT NULL;
 
-scored = candidates.with_columns({
-    "JW": jw,
-    "LEV_SIM": lev_sim,
-    "SCORE": JW_WT * jw + LEV_WT * lev_sim
-})
-
-# ---- pick best merchant per brand ----
-w = Window.partition_by("BRAND_RAW").order_by(col("SCORE").desc())
-best = scored.with_column("RN", call_function("ROW_NUMBER").over(w)) \
-             .filter(col("RN") == 1) \
-             .drop("RN")
-
-# ---- confidence bands and exists flag ----
-best = best.with_column(
-    "CONFIDENCE",
-    when(col("SCORE") >= lit(HIGH), lit("HIGH"))
-     .when(col("SCORE") >= lit(MED),  lit("MEDIUM"))
-     .otherwise(lit("LOW"))
-).with_column(
-    "EXISTS_IN_TX", (col("SCORE") >= lit(MED)).cast("int")
+-- 2b) Best match from your brand list using Jaro–Winkler
+WITH DIR AS (
+  SELECT UPPER(BRANDS) AS BRAND FROM "SBOX_CONSUMERBANKING_DB"."DEPOSITS_CARDS_CHNL_PROD"."TYSONS_STORE_DIR_DM"
+),
+C AS (
+  SELECT UPPER(MERCH_BRAND) AS MERCH_BRAND, MERCH_RAW FROM MERCH_CANON WHERE MERCH_BRAND IS NOT NULL
 )
+SELECT
+  C.MERCH_RAW,
+  C.MERCH_BRAND,
+  D.BRAND,
+  JARO_WINKLER_SIMILARITY(C.MERCH_BRAND, D.BRAND) AS SCORE
+FROM C JOIN D ON TRUE
+QUALIFY ROW_NUMBER() OVER (PARTITION BY C.MERCH_RAW ORDER BY SCORE DESC) = 1
+ORDER BY SCORE DESC;
 
-result = best.select(
-    col("BRAND_RAW").alias("BRAND"),
-    col("MERCH_RAW").alias("BEST_MATCH_MERCHANT"),
-    col("JW").alias("jw_char_sim"),
-    col("LEV_SIM").alias("lev_char_sim"),
-    col("SCORE").alias("combined_score"),
-    col("CONFIDENCE"),
-    col("EXISTS_IN_TX")
-)
+Add a confidence:
 
-# coverage metric
-metrics = result.agg(
-    call_function("COUNT_IF", col("EXISTS_IN_TX") == lit(1)).alias("matched_brands"),
-    call_function("COUNT", lit(1)).alias("total_brands")
-).with_column("coverage_pct", (col("matched_brands")*100.0 / col("total_brands")))
+SELECT *,
+  CASE WHEN SCORE >= 0.92 THEN 'HIGH'
+       WHEN SCORE >= 0.86 THEN 'MEDIUM'
+       ELSE 'LOW' END AS CONFIDENCE
+FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
 
-result.show()     # per-brand best match with scores and confidence
-metrics.show()    # overall coverage
-# result.write.save_as_table('ANALYTICS.BRAND_MATCHES_CHAR', mode='overwrite')
+
+---
+
+Why these work for “Abercrombie & Fitch ↔ A&F ↔ Fitch”
+
+Embeddings capture semantics and abbreviations (A&F, Fitch) → high cosine to “Abercrombie & Fitch”.
+
+Canonicalization strips noise (“STORE #10647”, “*TYSONS PLAYGROUND”) before a simpler character similarity.
+
+
+
+---
+
+Quick fixes for the errors you saw
+
+Use the fully-qualified function: SNOWFLAKE.CORTEX.COMPLETE('model','prompt') or SNOWFLAKE.CORTEX.EXTRACT_ANSWER(q, context).
+
+Don’t put window functions in a WHERE; use QUALIFY.
+
+If you SET prompt='...', reference it as $prompt (no brackets) in SQL strings.
+
+End statements with semicolons in Worksheets.
+
+
+
+---
+
+If you want top-k candidates per brand (for review), change ROW_NUMBER() = 1 to <= 3. I can also add a tiny “brand variants” expansion (A&F / AF / Fitch) on the query side for an even stronger embedding match if your directory has many short names.
+
