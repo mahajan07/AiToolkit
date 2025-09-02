@@ -1,60 +1,54 @@
--- 1) Tokenize each name into distinct word sets
-with vd_tokens as (
-  select
-    VENDOR,
-    CITY,
-    array_agg(distinct value) as tokens
-  from VENDOR_DIRECTORY,
-       lateral split_to_table(VENDOR, ' ')
-  group by 1,2
+WITH vd_tokens AS (
+  SELECT
+    UPPER(BRAND) AS VENDOR,
+    ARRAY_AGG(DISTINCT VALUE) AS TOKENS
+  FROM VENDOR_DIRECTORY,
+       LATERAL SPLIT_TO_TABLE(UPPER(BRAND), ' ')
+  GROUP BY 1
 ),
-tx_tokens as (
-  select
+tx_tokens AS (
+  SELECT
     DAF_MERCH_NAME,
     DAF_MERCH_CITY,
-    array_agg(distinct value) as tokens
-  from TRANSACTIONS,
-       lateral split_to_table(DAF_MERCH_NAME, ' ')
-  group by 1,2
+    ARRAY_AGG(DISTINCT VALUE) AS TOKENS
+  FROM TRANSACTIONS,
+       LATERAL SPLIT_TO_TABLE(UPPER(DAF_MERCH_NAME), ' ')
+  WHERE UPPER(DAF_MERCH_CITY) LIKE '%TYSON%'
+  GROUP BY 1,2
 ),
-
--- 2) Build candidate pairs by location (city match here; switch to ZIP if better)
-pairs as (
-  select
-    v.VENDOR, v.CITY as vendor_city, v.tokens as v_tokens,
-    t.DAF_MERCH_NAME, t.DAF_MERCH_CITY as tx_city, t.tokens as t_tokens
-  from vd_tokens v
-  join tx_tokens t on v.CITY = t.DAF_MERCH_CITY
+pairs AS (
+  SELECT
+    v.VENDOR, t.DAF_MERCH_NAME, t.DAF_MERCH_CITY, v.TOKENS AS V_TOK, t.TOKENS AS T_TOK
+  FROM vd_tokens v
+  JOIN tx_tokens t ON TRUE
 ),
-
--- 3) Compute Jaccard = |intersection| / |union|
---    We do this by exploding arrays, counting overlaps, and recombining.
-intersections as (
-  select
-    p.VENDOR, p.vendor_city, p.DAF_MERCH_NAME, p.tx_city,
-    count(distinct vt.value) as inter_cnt
-  from pairs p,
-       lateral flatten(input => p.v_tokens) vt,
-       lateral flatten(input => p.t_tokens) tt
-  where vt.value = tt.value
-  group by 1,2,3,4
+intersections AS (
+  SELECT
+    p.VENDOR, p.DAF_MERCH_NAME, p.DAF_MERCH_CITY,
+    COUNT(DISTINCT vt.VALUE) AS inter_cnt
+  FROM pairs p,
+       LATERAL FLATTEN(INPUT => p.V_TOK) vt,
+       LATERAL FLATTEN(INPUT => p.T_TOK) tt
+  WHERE vt.VALUE = tt.VALUE
+  GROUP BY 1,2,3
 ),
-sizes as (
-  select
-    VENDOR, vendor_city, DAF_MERCH_NAME, tx_city,
-    -- sizes of sets
-    (select count(distinct value) from lateral flatten(input => v_tokens)) as v_size,
-    (select count(distinct value) from lateral flatten(input => t_tokens)) as t_size
-  from pairs
+sizes AS (
+  SELECT
+    p.VENDOR, p.DAF_MERCH_NAME, p.DAF_MERCH_CITY,
+    (SELECT COUNT(DISTINCT VALUE) FROM LATERAL FLATTEN(INPUT => p.V_TOK)) AS v_size,
+    (SELECT COUNT(DISTINCT VALUE) FROM LATERAL FLATTEN(INPUT => p.T_TOK)) AS t_size
+  FROM pairs p
 )
-select
-  s.VENDOR, s.vendor_city, s.DAF_MERCH_NAME, s.tx_city,
+SELECT
+  s.VENDOR,
+  s.DAF_MERCH_NAME AS MATCHED_MERCHANT,
+  s.DAF_MERCH_CITY AS MATCHED_CITY,
   i.inter_cnt,
-  (s.v_size + s.t_size - i.inter_cnt) as union_cnt,
-  (i.inter_cnt * 1.0) / nullif((s.v_size + s.t_size - i.inter_cnt),0) as jaccard
-from sizes s
-left join intersections i
-  on s.VENDOR = i.VENDOR and s.DAF_MERCH_NAME = i.DAF_MERCH_NAME
-qualify row_number() over (partition by s.VENDOR order by jaccard desc) = 1
--- Where jaccard >= 0.5 is a good starting point
-order by jaccard desc;
+  (s.v_size + s.t_size - i.inter_cnt) AS union_cnt,
+  (i.inter_cnt * 1.0) / NULLIF(s.v_size + s.t_size - i.inter_cnt, 0) AS jaccard
+FROM sizes s
+LEFT JOIN intersections i
+  ON s.VENDOR = i.VENDOR AND s.DAF_MERCH_NAME = i.DAF_MERCH_NAME
+QUALIFY ROW_NUMBER() OVER (PARTITION BY s.VENDOR ORDER BY jaccard DESC) = 1
+-- WHERE jaccard >= 0.55
+ORDER BY jaccard DESC;
