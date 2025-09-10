@@ -1,111 +1,128 @@
-Here’s a polished email draft you can use for sending out the reconciliation update. I’ve structured it with a clear subject line, intro, per-strategy reconciliation, and closing notes with variance questions.
+-- ================================
+-- Tysons: Merchant → Brand matcher
+-- One script, low complexity
+-- ================================
 
+-- Helper UDFs (temporary to your session)
+create or replace temporary function ZIP5(s string)
+returns string
+language sql
+as $$
+  regexp_substr(coalesce(s,''), '(\\d{5})')
+$$;
 
----
+create or replace temporary function CANON(s string)
+returns string
+language sql
+as $$
+  -- Uppercase, strip phones / numbers / mall-location words, keep letters, spaces, and '&'
+  regexp_replace(
+    regexp_replace(
+      regexp_replace(
+        regexp_replace(
+          upper(coalesce(s,'')),
+          '(\\+?1[\\-\\.\\s]?)?\\(?\\d{3}\\)?[\\-\\.\\s]?\\d{3}[\\-\\.\\s]?\\d{4}', ' '),  -- phone
+        '(#\\d+|[0-9]{2,})', ' '),                                                       -- store numbers / long nums
+      '\\b(TYSONS|TYSON\\'?S|MCLEAN|VIENNA|CORNER|CENTER|CTR|MALL|UNITED STATES|USA|VA)\\b', ' '),
+    '[^A-Z& ]', ' '                                                                    -- keep A-Z, space, &
+  )
+$$;
 
-Subject: PenFed Points Reconciliation – May 2025 (Vendor vs Accounting Snapshot)
+with
+-- 1) Brand directory (normalize once)
+BRANDS as (
+  select
+    brands as brand_raw,
+    trim(regexp_replace(CANON(brands), '\\s+', ' ')) as brand_norm,
+    length(trim(regexp_replace(CANON(brands), '\\s+', ' '))) as brand_len
+  from "SBOX_CONSUMERBANKING_BI"."DEPOSITS_CARDS_CHNL_PROD"."<TYSONS_BRAND_TABLE>"
+  where brands is not null
+),
 
-Hi Team,
+-- Minimal alias map for common edge cases (kept tiny on purpose)
+ALIASES as (
+  select * from values
+    ('AMC',                   'AMC THEATRES'),
+    ('ARC TERYX',             'ARCTERYX'),
+    ('AMERICAN EAGLE',        'AMERICAN EAGLE OUTFITTERS'),
+    ('APPLE STORE',           'APPLE')
+  as T(alias_norm_raw, brand_canonical_raw)
+),
+BRANDS_EXPANDED as (
+  select brand_raw, brand_norm, brand_len from BRANDS
+  union all
+  select
+    brand_canonical_raw as brand_raw,
+    trim(regexp_replace(CANON(alias_norm_raw), '\\s+', ' ')) as brand_norm,
+    length(trim(regexp_replace(CANON(alias_norm_raw), '\\s+', ' '))) as brand_len
+  from ALIASES
+),
 
-Please find below the reconciliation of Accounting vs InComm vendor-provided points data for May 2025. This covers all bonus strategies and highlights variances requiring clarification.
+-- 2) Transactions (ZIP gate + normalization)
+TX as (
+  select
+    t.*,
+    ZIP5(t.DAF_MERCH_ZIP_CODE) as zip5,
+    trim(regexp_replace(CANON(t.DAF_MERCH_NAME), '\\s+', ' ')) as merch_norm
+  from "PTX_DB1"."O_RAW"."SCH_RAW_AUTHFILE" t
+  where upper(coalesce(t.DAF_MERCH_STATE_COUNTRY,'')) = 'VA'
+    and (
+      ZIP5(t.DAF_MERCH_ZIP_CODE) in ('22102','22182')
+      or upper(coalesce(t.DAF_MERCH_CITY,'')) like '%TYSON%'
+      or upper(coalesce(t.DAF_MERCH_NAME,'')) like '%TYSON%'
+    )
+),
 
+-- 3) Single fuzzy pass (plus short-name safeguard)
+CANDIDATES as (
+  select
+    t.*,
+    b.brand_raw,
+    b.brand_norm,
+    JAROWINKLER_SIMILARITY(t.merch_norm, b.brand_norm) as jw,
+    EDITDISTANCE(t.merch_norm, b.brand_norm)           as ed
+  from TX t
+  join BRANDS_EXPANDED b
+    on (
+         JAROWINKLER_SIMILARITY(t.merch_norm, b.brand_norm) >= 0.92
+         or (b.brand_len <= 5 and EDITDISTANCE(t.merch_norm, b.brand_norm) <= 1)
+       )
+),
 
----
+-- 4) Pick the single best brand per transaction (adjust partition key if you have a TXN_ID)
+TOP1 as (
+  select
+    *,
+    row_number() over (
+      partition by merch_norm, zip5, coalesce(PERIODID,0), coalesce(DAF_AMOUNT,0)
+      order by jw desc, ed asc, length(brand_norm) desc
+    ) as rn
+  from CANDIDATES
+)
 
-Reconciliation by Bonus Strategy
+-- 5) Final output: top-1 match + confidence; safe UNKNOWN fallback
+select
+  t.PERIODID,
+  t.DAF_MERCH_NAME,
+  t.DAF_MERCH_CITY,
+  t.DAF_MERCH_STATE_COUNTRY,
+  t.DAF_MERCH_ZIP_CODE,
+  t.zip5,
+  t.DAF_AMOUNT,
+  t.merch_norm,
 
-PFVISAPR
-
-Accounting and InComm balances match across earned, redeemed, adjusted, and outstanding.
-
-Delta reconciles cleanly.
-✅ No issues.
-
-
-PFVISASG
-
-Fully reconciles between Accounting and InComm.
-✅ No issues.
-
-
-PFTVLSTN
-
-Accounting: Earned 7.1M, Redeemed 13.3M, Adjusted 119k, Outstanding ~7.15M.
-
-InComm: Balances align.
-
-Delta: Variance of +713,889 points (~$16.5M impact).
-⚠️ Requires vendor review of redemption vs outstanding balances.
-
-
-PFTVLPLS
-
-Accounting: Earned 32.2M, Redeemed 25.5M, Adjusted 185k, Outstanding ~5.6M.
-
-InComm: Earned 33.9M, Redeemed 25.5M, Adjusted 185k, Outstanding ~7.1M.
-
-Delta: Negative variance (1.32M points).
-⚠️ Likely tied to redemption timing differences; vendor input requested.
-
-
-CACHEBLU
-
-Accounting: Earned 218.3M, Redeemed 212.5M, Adjusted 1.07M, Outstanding ~11.6M.
-
-InComm: Earned 227.4M, Redeemed 212.4M, Adjusted 1.07M, Outstanding ~14.4M.
-
-Delta: Variance of (3.3M) points.
-⚠️ Needs clarification on whether expired points were handled differently.
-
-
-CACHEBLK
-
-Accounting: Earned 56.5M, Redeemed 54.2M, Adjusted 1.36M, Outstanding ~5.9M.
-
-InComm: Earned 106.2M, Redeemed 54.1M, Adjusted 1.36M, Outstanding ~57.9M.
-
-Delta: Negative variance (4.5M points).
-⚠️ Significant discrepancy; requires breakdown of redemption and expiration treatment.
-
-
-
----
-
-Key Takeaways
-
-All PFVISAPR and PFVISASG strategies reconcile correctly.
-
-Variances are concentrated in PFTVLSTN, PFTVLPLS, CACHEBLU, and CACHEBLK.
-
-These differences likely stem from timing mismatches in redemption capture, expired points processing, or vendor reporting adjustments.
-
-
-
----
-
-Questions for Vendor (InComm)
-
-1. Can you confirm redemption timing treatment for PFTVLSTN and PFTVLPLS?
-
-
-2. For CACHEBLU, are expired points recognized differently between systems?
-
-
-3. For CACHEBLK, please provide a detailed breakdown of redemption vs expiration to explain the multi-million point variance.
-
-
-
-
----
-
-Thank you,
-[Your Name]
-
-
----
-
-Would you like me to also create a concise version of this email (executive summary style, one paragraph + key variances table), in case you want to send it to senior leadership alongside this detailed breakdown?
-
-
-
-8
+  coalesce(x.brand_raw, 'UNKNOWN') as matched_brand,
+  x.jw, x.ed,
+  case
+    when x.jw >= 0.96 then 'HIGH'
+    when x.jw >= 0.92 then 'MEDIUM'
+    when x.brand_raw is not null then 'LOW'
+    else 'NONE'
+  end as match_confidence,
+  case when x.brand_raw is null then 1 else 0 end as is_unmatched
+from TX t
+left join TOP1 x
+  on t.merch_norm = x.merch_norm
+ and t.zip5       = x.zip5
+ and x.rn = 1
+;
