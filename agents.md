@@ -1,113 +1,42 @@
 ```bash
 -- =====================================================
--- TYSONS CORNER CENTER TRANSACTION CLASSIFICATION
--- Multi-stage approach: Geographic Filter → Name Matching
+-- OPTIMIZED TYSONS CORNER CLASSIFICATION
+-- Using sandbox tables and improved cleaning function
 -- =====================================================
 
--- Step 1: Create helper function for cleaning merchant names
-CREATE OR REPLACE FUNCTION CLEAN_MERCHANT_NAME(merchant_name STRING)
+-- Step 1: Create improved cleaning function
+CREATE OR REPLACE FUNCTION clean_merchant_name_v2(s STRING)
 RETURNS STRING
 LANGUAGE SQL
 AS
 $$
-  UPPER(
+  TRIM(
     REGEXP_REPLACE(
       REGEXP_REPLACE(
         REGEXP_REPLACE(
           REGEXP_REPLACE(
-            REGEXP_REPLACE(merchant_name, '\\s*#\\d+.*$', ''), -- Remove store numbers and everything after
-            '\\s+(VA|VIRGINIA|MD|MARYLAND|DC)\\s*$', ''), -- Remove state suffixes
-          '\\s+(MCLEAN|VIENNA|TYSONS|FALLS CHURCH).*$', ''), -- Remove city suffixes
-        '[^A-Z0-9\\s&]', ''), -- Remove special characters except & and spaces
-      '\\s+', ' ') -- Normalize whitespace
-    )
+            UPPER(COALESCE(s,'')),
+            '(\\+?1[\\-\\.\\s]?)?\\(?\\d{3}\\)?[\\-\\.\\s]?\\d{3}[\\-\\.\\s]?\\d{4}', ' '),  -- phone
+          '(#\\d+|[0-9]{2,})', ' '),                                                     -- store numbers / long numbers
+        '\\b(TYSONS|TYSON\\'?S|MCLEAN|VIENNA|CORNER|CENTER|CTR|MALL|UNITED STATES|USA|VA)\\b', ' '), -- stopwords
+      '[^A-Z& ]', ' '),                                                                  -- keep letters, space, &
+    '\\s+', ' ')                                                                          -- squeeze spaces
+  )
 $$;
 
--- Step 2: Main classification query with confidence scoring
-WITH geographic_filter AS (
-  SELECT 
-    *,
-    CASE 
-      -- High confidence geographic indicators
-      WHEN DAF_MERCH_ZIP_CODE IN ('22102-4501', '22102-4601', '22102-4698', '22102-4603', '22102-5953') THEN 'HIGH_GEO_CONFIDENCE'
-      -- Medium confidence (primary Tysons ZIP codes)
-      WHEN LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182') THEN 'MEDIUM_GEO_CONFIDENCE'
-      -- Low confidence (broader area)
-      WHEN DAF_MERCH_STATE_COUNTRY = 'VA' 
-           AND DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER') THEN 'LOW_GEO_CONFIDENCE'
-      ELSE 'NO_GEO_MATCH'
-    END AS geo_confidence_level
-  FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
-  WHERE DAF_MERCH_STATE_COUNTRY = 'VA'
-),
+-- Step 2: Create sandbox table for cleaned brands (run once, then reuse)
+CREATE OR REPLACE TABLE SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brands_cleaned AS
+SELECT 
+  BRAND_RAW,
+  clean_merchant_name_v2(BRAND_RAW) as cleaned_brand_name,
+  LENGTH(BRAND_RAW) as brand_length,
+  CURRENT_TIMESTAMP() as created_at
+FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brand_directory
+WHERE clean_merchant_name_v2(BRAND_RAW) IS NOT NULL 
+  AND LENGTH(clean_merchant_name_v2(BRAND_RAW)) > 2;  -- Avoid very short brand names
 
-brand_matching AS (
-  SELECT 
-    t.*,
-    b.BRAND_RAW as matched_brand,
-    CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) as cleaned_merchant_name,
-    
-    -- Fuzzy matching with different algorithms
-    EDITDISTANCE(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) as edit_distance,
-    JAROWINKLER_SIMILARITY(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) as jaro_similarity,
-    
-    -- Contains matching (for partial matches)
-    CASE 
-      WHEN CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) = UPPER(b.BRAND_RAW) THEN 100
-      WHEN CONTAINS(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) 
-           OR CONTAINS(UPPER(b.BRAND_RAW), CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME)) THEN 85
-      ELSE 0
-    END as contains_match_score,
-    
-    -- Calculate overall name matching confidence
-    GREATEST(
-      CASE WHEN CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) = UPPER(b.BRAND_RAW) THEN 100 ELSE 0 END,
-      CASE WHEN CONTAINS(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) 
-                OR CONTAINS(UPPER(b.BRAND_RAW), CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME)) THEN 85 ELSE 0 END,
-      ROUND(JAROWINKLER_SIMILARITY(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) * 100, 2),
-      CASE WHEN EDITDISTANCE(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) <= 2 THEN 75 ELSE 0 END
-    ) as name_confidence_score
-    
-  FROM geographic_filter t
-  LEFT JOIN SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brand_directory b
-    ON (
-      -- Direct match
-      CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) = UPPER(b.BRAND_RAW)
-      -- Contains match
-      OR CONTAINS(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW))
-      OR CONTAINS(UPPER(b.BRAND_RAW), CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME))
-      -- Fuzzy match (Jaro-Winkler similarity > 0.8)
-      OR JAROWINKLER_SIMILARITY(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) > 0.8
-      -- Edit distance <= 3 for reasonable fuzzy matching
-      OR (EDITDISTANCE(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) <= 3 
-          AND LENGTH(UPPER(b.BRAND_RAW)) > 4)
-    )
-),
-
-final_classification AS (
-  SELECT 
-    *,
-    -- Calculate combined confidence score
-    CASE 
-      WHEN geo_confidence_level = 'HIGH_GEO_CONFIDENCE' AND name_confidence_score >= 75 THEN 95
-      WHEN geo_confidence_level = 'HIGH_GEO_CONFIDENCE' AND name_confidence_score >= 50 THEN 85
-      WHEN geo_confidence_level = 'MEDIUM_GEO_CONFIDENCE' AND name_confidence_score >= 85 THEN 90
-      WHEN geo_confidence_level = 'MEDIUM_GEO_CONFIDENCE' AND name_confidence_score >= 75 THEN 80
-      WHEN geo_confidence_level = 'LOW_GEO_CONFIDENCE' AND name_confidence_score >= 90 THEN 75
-      WHEN name_confidence_score = 100 THEN 70 -- Perfect name match but no geo confirmation
-      ELSE 0
-    END as overall_confidence_score,
-    
-    -- Final classification
-    CASE 
-      WHEN (geo_confidence_level = 'HIGH_GEO_CONFIDENCE' AND name_confidence_score >= 50)
-        OR (geo_confidence_level = 'MEDIUM_GEO_CONFIDENCE' AND name_confidence_score >= 75)
-        OR (geo_confidence_level = 'LOW_GEO_CONFIDENCE' AND name_confidence_score >= 90) THEN 'In TysonsCC'
-      ELSE 'Outside TysonsCC'
-    END as tysons_classification
-  FROM brand_matching
-)
-
+-- Step 3: Create sandbox table for cleaned transactions (run daily/weekly)
+CREATE OR REPLACE TABLE SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned AS
 SELECT 
   PERIODID,
   DAF_MERCH_CAT,
@@ -116,86 +45,225 @@ SELECT
   DAF_MERCH_CITY,
   DAF_MERCH_STATE_COUNTRY,
   DAF_AMOUNT,
+  PERIODDATE,
   
-  -- Classification results
-  tysons_classification,
-  overall_confidence_score,
+  -- Cleaned merchant name
+  clean_merchant_name_v2(DAF_MERCH_NAME) as cleaned_merchant_name,
   
-  -- Debug information
-  cleaned_merchant_name,
-  matched_brand,
-  geo_confidence_level,
-  name_confidence_score,
-  edit_distance,
-  jaro_similarity,
-  contains_match_score
+  -- Pre-computed geographic confidence (numeric for performance)
+  CASE 
+    WHEN DAF_MERCH_ZIP_CODE IN ('22102-4501', '22102-4601', '22102-4698', '22102-4603', '22102-5953') THEN 3
+    WHEN LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182') THEN 2
+    WHEN DAF_MERCH_STATE_COUNTRY = 'VA' 
+         AND DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER') THEN 1
+    ELSE 0
+  END AS geo_confidence_level,
   
-FROM final_classification
-WHERE overall_confidence_score > 0  -- Only show potential matches
-ORDER BY overall_confidence_score DESC, DAF_AMOUNT DESC;
+  CURRENT_TIMESTAMP() as processed_at
+  
+FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
+WHERE DAF_MERCH_STATE_COUNTRY = 'VA'
+  AND PERIODDATE >= '2024-01-01'  -- Adjust date range as needed
+  AND (
+    LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182') 
+    OR DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER')
+  )
+  AND clean_merchant_name_v2(DAF_MERCH_NAME) IS NOT NULL
+  AND LENGTH(clean_merchant_name_v2(DAF_MERCH_NAME)) > 2;
+
+-- Step 4: Create indexes for performance
+CREATE INDEX IF NOT EXISTS idx_cleaned_merchant ON 
+  SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned(cleaned_merchant_name);
+
+CREATE INDEX IF NOT EXISTS idx_geo_level ON 
+  SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned(geo_confidence_level);
+
+CREATE INDEX IF NOT EXISTS idx_cleaned_brand ON 
+  SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brands_cleaned(cleaned_brand_name);
 
 -- =====================================================
--- ALTERNATIVE: SIMPLIFIED VERSION FOR PRODUCTION
+-- FAST MATCHING QUERY (using pre-computed tables)
 -- =====================================================
 
--- If you want a simpler, faster query for production use:
-CREATE OR REPLACE VIEW TYSONS_TRANSACTIONS_CLASSIFIED AS
-WITH base_filter AS (
-  SELECT *,
-    UPPER(REGEXP_REPLACE(REGEXP_REPLACE(DAF_MERCH_NAME, '\\s*#\\d+.*$', ''), '[^A-Z0-9\\s&]', '')) as clean_name
-  FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
-  WHERE DAF_MERCH_STATE_COUNTRY = 'VA'
-    AND (LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182')
-         OR DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER'))
+-- Step 5: Ultra-fast matching using sandbox tables
+WITH potential_matches AS (
+  SELECT 
+    t.PERIODID,
+    t.DAF_MERCH_CAT,
+    t.DAF_MERCH_ZIP_CODE,
+    t.DAF_MERCH_NAME,
+    t.DAF_MERCH_CITY,
+    t.DAF_MERCH_STATE_COUNTRY,
+    t.DAF_AMOUNT,
+    t.cleaned_merchant_name,
+    t.geo_confidence_level,
+    
+    b.BRAND_RAW,
+    b.cleaned_brand_name,
+    
+    -- Calculate match score (prioritize exact > contains > fuzzy)
+    CASE 
+      WHEN t.cleaned_merchant_name = b.cleaned_brand_name THEN 100
+      WHEN CONTAINS(t.cleaned_merchant_name, b.cleaned_brand_name) THEN 90
+      WHEN CONTAINS(b.cleaned_brand_name, t.cleaned_merchant_name) THEN 85
+      ELSE GREATEST(0, ROUND(JAROWINKLER_SIMILARITY(t.cleaned_merchant_name, b.cleaned_brand_name) * 100, 0))
+    END as name_match_score,
+    
+    -- Add brand length for tie-breaking (prefer longer, more specific brands)
+    b.brand_length,
+    
+    -- Row number to get best match per transaction
+    ROW_NUMBER() OVER (
+      PARTITION BY t.PERIODID, t.DAF_MERCH_NAME
+      ORDER BY 
+        CASE 
+          WHEN t.cleaned_merchant_name = b.cleaned_brand_name THEN 100
+          WHEN CONTAINS(t.cleaned_merchant_name, b.cleaned_brand_name) THEN 90
+          WHEN CONTAINS(b.cleaned_brand_name, t.cleaned_merchant_name) THEN 85
+          ELSE GREATEST(0, ROUND(JAROWINKLER_SIMILARITY(t.cleaned_merchant_name, b.cleaned_brand_name) * 100, 0))
+        END DESC,
+        b.brand_length DESC,
+        b.BRAND_RAW ASC  -- Consistent ordering for ties
+    ) as match_rank
+    
+  FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned t
+  INNER JOIN SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brands_cleaned b
+    ON (
+      -- Efficient join conditions to avoid cartesian product
+      t.cleaned_merchant_name = b.cleaned_brand_name
+      OR CONTAINS(t.cleaned_merchant_name, b.cleaned_brand_name)
+      OR CONTAINS(b.cleaned_brand_name, t.cleaned_merchant_name)
+      OR (LENGTH(b.cleaned_brand_name) > 3 
+          AND JAROWINKLER_SIMILARITY(t.cleaned_merchant_name, b.cleaned_brand_name) > 0.8)
+    )
+  WHERE t.PERIODDATE >= '2025-01-01'  -- Recent data only for testing
+),
+
+best_matches AS (
+  SELECT *
+  FROM potential_matches
+  WHERE match_rank = 1  -- Only the best match per transaction
+    AND name_match_score >= 75  -- Minimum confidence threshold
 )
 
+-- Final classification
 SELECT 
-  t.*,
+  PERIODID,
+  DAF_MERCH_CAT,
+  DAF_MERCH_ZIP_CODE,
+  DAF_MERCH_NAME,
+  DAF_MERCH_CITY,
+  DAF_MERCH_STATE_COUNTRY,
+  DAF_AMOUNT,
+  cleaned_merchant_name,
+  BRAND_RAW as matched_brand,
+  
+  -- Overall confidence score
   CASE 
-    WHEN b.BRAND_RAW IS NOT NULL 
-         AND (DAF_MERCH_ZIP_CODE LIKE '22102-%' OR LEFT(DAF_MERCH_ZIP_CODE, 5) = '22102') 
-    THEN 'In TysonsCC'
+    WHEN geo_confidence_level = 3 AND name_match_score >= 90 THEN 95
+    WHEN geo_confidence_level = 3 AND name_match_score >= 75 THEN 90
+    WHEN geo_confidence_level = 2 AND name_match_score >= 95 THEN 90
+    WHEN geo_confidence_level = 2 AND name_match_score >= 85 THEN 85
+    WHEN geo_confidence_level = 2 AND name_match_score >= 75 THEN 80
+    WHEN geo_confidence_level = 1 AND name_match_score >= 95 THEN 75
+    WHEN name_match_score = 100 THEN 70  -- Perfect name match but no geo
+    ELSE GREATEST(50, name_match_score - 10)  -- Minimum viable confidence
+  END as overall_confidence_score,
+  
+  -- Classification
+  CASE 
+    WHEN (geo_confidence_level >= 2 AND name_match_score >= 75)
+      OR (geo_confidence_level = 1 AND name_match_score >= 95)
+      OR name_match_score = 100 THEN 'In TysonsCC'
     ELSE 'Outside TysonsCC'
   END as tysons_classification,
   
-  CASE 
-    WHEN b.BRAND_RAW IS NOT NULL AND DAF_MERCH_ZIP_CODE LIKE '22102-%' THEN 90
-    WHEN b.BRAND_RAW IS NOT NULL AND LEFT(DAF_MERCH_ZIP_CODE, 5) = '22102' THEN 75
-    ELSE 0
-  END as confidence_score
+  -- Debug info
+  CASE geo_confidence_level 
+    WHEN 3 THEN 'HIGH_GEO' 
+    WHEN 2 THEN 'MEDIUM_GEO' 
+    WHEN 1 THEN 'LOW_GEO' 
+    ELSE 'NO_GEO' 
+  END as geo_level,
+  name_match_score
 
-FROM base_filter t
-LEFT JOIN SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brand_directory b
-  ON (t.clean_name LIKE '%' || UPPER(b.BRAND_RAW) || '%' 
-      OR UPPER(b.BRAND_RAW) LIKE '%' || t.clean_name || '%'
-      OR JAROWINKLER_SIMILARITY(t.clean_name, UPPER(b.BRAND_RAW)) > 0.8);
+FROM best_matches
+ORDER BY overall_confidence_score DESC, DAF_AMOUNT DESC
+LIMIT 100;
 
 -- =====================================================
--- VALIDATION QUERIES
+-- QUICK VALIDATION QUERIES
 -- =====================================================
 
--- Check matching effectiveness
+-- Check data quality after cleaning
 SELECT 
-  tysons_classification,
-  COUNT(*) as transaction_count,
-  COUNT(DISTINCT matched_brand) as unique_brands_matched,
-  AVG(overall_confidence_score) as avg_confidence,
-  SUM(DAF_AMOUNT) as total_amount
-FROM final_classification
-GROUP BY tysons_classification;
+  'Brands' as table_type,
+  COUNT(*) as total_records,
+  COUNT(DISTINCT cleaned_brand_name) as unique_cleaned_names,
+  AVG(LENGTH(cleaned_brand_name)) as avg_cleaned_length
+FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brands_cleaned
 
--- Review low confidence matches for tuning
+UNION ALL
+
 SELECT 
-  DAF_MERCH_NAME,
-  cleaned_merchant_name,
-  matched_brand,
-  geo_confidence_level,
-  name_confidence_score,
-  overall_confidence_score,
+  'Transactions' as table_type,
+  COUNT(*) as total_records,
+  COUNT(DISTINCT cleaned_merchant_name) as unique_cleaned_names,
+  AVG(LENGTH(cleaned_merchant_name)) as avg_cleaned_length
+FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned
+WHERE PERIODDATE >= '2025-01-01';
+
+-- Sample of cleaned vs original names
+SELECT 
+  DAF_MERCH_NAME as original_name,
+  cleaned_merchant_name as cleaned_name,
   COUNT(*) as frequency
-FROM final_classification
-WHERE overall_confidence_score BETWEEN 50 AND 75
-GROUP BY 1,2,3,4,5,6
-ORDER BY frequency DESC, overall_confidence_score DESC
-LIMIT 50
+FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned
+WHERE PERIODDATE >= '2025-01-01'
+GROUP BY 1, 2
+ORDER BY frequency DESC
+LIMIT 20;
+
+-- =====================================================
+-- INCREMENTAL UPDATE PROCEDURE (for production)
+-- =====================================================
+
+-- For daily updates, create this procedure
+CREATE OR REPLACE PROCEDURE update_tysons_transactions_incremental(start_date DATE)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+  -- Delete existing data for the date range
+  DELETE FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned
+  WHERE PERIODDATE >= start_date;
+  
+  -- Insert new cleaned data
+  INSERT INTO SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_transactions_cleaned
+  SELECT 
+    PERIODID, DAF_MERCH_CAT, DAF_MERCH_ZIP_CODE, DAF_MERCH_NAME,
+    DAF_MERCH_CITY, DAF_MERCH_STATE_COUNTRY, DAF_AMOUNT, PERIODDATE,
+    clean_merchant_name_v2(DAF_MERCH_NAME) as cleaned_merchant_name,
+    CASE 
+      WHEN DAF_MERCH_ZIP_CODE IN ('22102-4501', '22102-4601', '22102-4698', '22102-4603', '22102-5953') THEN 3
+      WHEN LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182') THEN 2
+      WHEN DAF_MERCH_STATE_COUNTRY = 'VA' 
+           AND DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER') THEN 1
+      ELSE 0
+    END AS geo_confidence_level,
+    CURRENT_TIMESTAMP() as processed_at
+  FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
+  WHERE DAF_MERCH_STATE_COUNTRY = 'VA'
+    AND PERIODDATE >= start_date
+    AND (LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182') 
+         OR DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER'))
+    AND clean_merchant_name_v2(DAF_MERCH_NAME) IS NOT NULL
+    AND LENGTH(clean_merchant_name_v2(DAF_MERCH_NAME)) > 2;
+    
+  RETURN 'Successfully updated transactions from ' || start_date;
+END;
+$$;
+
+-- Usage: CALL update_tysons_transactions_incremental('2025-09-01');
 ```
