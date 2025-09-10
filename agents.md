@@ -1,3 +1,4 @@
+```bash
 -- ================================
 -- Tysons: Merchant → Brand matcher
 -- One script, low complexity
@@ -123,6 +124,7 @@ select
 from TX t
 left join TOP1 x
   on t.merch_norm = x.merch_norm
+```
  and t.zip5       = x.zip5
  and x.rn = 1
 ;
