@@ -197,5 +197,5 @@ FROM final_classification
 WHERE overall_confidence_score BETWEEN 50 AND 75
 GROUP BY 1,2,3,4,5,6
 ORDER BY frequency DESC, overall_confidence_score DESC
-LIMIT 50;
+LIMIT 50
 ```
