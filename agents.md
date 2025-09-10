@@ -1,130 +1,201 @@
 ```bash
--- ================================
--- Tysons: Merchant → Brand matcher
--- One script, low complexity
--- ================================
+-- =====================================================
+-- TYSONS CORNER CENTER TRANSACTION CLASSIFICATION
+-- Multi-stage approach: Geographic Filter → Name Matching
+-- =====================================================
 
--- Helper UDFs (temporary to your session)
-create or replace temporary function ZIP5(s string)
-returns string
-language sql
-as $$
-  regexp_substr(coalesce(s,''), '(\\d{5})')
+-- Step 1: Create helper function for cleaning merchant names
+CREATE OR REPLACE FUNCTION CLEAN_MERCHANT_NAME(merchant_name STRING)
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+  UPPER(
+    REGEXP_REPLACE(
+      REGEXP_REPLACE(
+        REGEXP_REPLACE(
+          REGEXP_REPLACE(
+            REGEXP_REPLACE(merchant_name, '\\s*#\\d+.*$', ''), -- Remove store numbers and everything after
+            '\\s+(VA|VIRGINIA|MD|MARYLAND|DC)\\s*$', ''), -- Remove state suffixes
+          '\\s+(MCLEAN|VIENNA|TYSONS|FALLS CHURCH).*$', ''), -- Remove city suffixes
+        '[^A-Z0-9\\s&]', ''), -- Remove special characters except & and spaces
+      '\\s+', ' ') -- Normalize whitespace
+    )
 $$;
 
-create or replace temporary function CANON(s string)
-returns string
-language sql
-as $$
-  -- Uppercase, strip phones / numbers / mall-location words, keep letters, spaces, and '&'
-  regexp_replace(
-    regexp_replace(
-      regexp_replace(
-        regexp_replace(
-          upper(coalesce(s,'')),
-          '(\\+?1[\\-\\.\\s]?)?\\(?\\d{3}\\)?[\\-\\.\\s]?\\d{3}[\\-\\.\\s]?\\d{4}', ' '),  -- phone
-        '(#\\d+|[0-9]{2,})', ' '),                                                       -- store numbers / long nums
-      '\\b(TYSONS|TYSON\\'?S|MCLEAN|VIENNA|CORNER|CENTER|CTR|MALL|UNITED STATES|USA|VA)\\b', ' '),
-    '[^A-Z& ]', ' '                                                                    -- keep A-Z, space, &
-  )
-$$;
-
-with
--- 1) Brand directory (normalize once)
-BRANDS as (
-  select
-    brands as brand_raw,
-    trim(regexp_replace(CANON(brands), '\\s+', ' ')) as brand_norm,
-    length(trim(regexp_replace(CANON(brands), '\\s+', ' '))) as brand_len
-  from "SBOX_CONSUMERBANKING_BI"."DEPOSITS_CARDS_CHNL_PROD"."<TYSONS_BRAND_TABLE>"
-  where brands is not null
+-- Step 2: Main classification query with confidence scoring
+WITH geographic_filter AS (
+  SELECT 
+    *,
+    CASE 
+      -- High confidence geographic indicators
+      WHEN DAF_MERCH_ZIP_CODE IN ('22102-4501', '22102-4601', '22102-4698', '22102-4603', '22102-5953') THEN 'HIGH_GEO_CONFIDENCE'
+      -- Medium confidence (primary Tysons ZIP codes)
+      WHEN LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182') THEN 'MEDIUM_GEO_CONFIDENCE'
+      -- Low confidence (broader area)
+      WHEN DAF_MERCH_STATE_COUNTRY = 'VA' 
+           AND DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER') THEN 'LOW_GEO_CONFIDENCE'
+      ELSE 'NO_GEO_MATCH'
+    END AS geo_confidence_level
+  FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
+  WHERE DAF_MERCH_STATE_COUNTRY = 'VA'
 ),
 
--- Minimal alias map for common edge cases (kept tiny on purpose)
-ALIASES as (
-  select * from values
-    ('AMC',                   'AMC THEATRES'),
-    ('ARC TERYX',             'ARCTERYX'),
-    ('AMERICAN EAGLE',        'AMERICAN EAGLE OUTFITTERS'),
-    ('APPLE STORE',           'APPLE')
-  as T(alias_norm_raw, brand_canonical_raw)
-),
-BRANDS_EXPANDED as (
-  select brand_raw, brand_norm, brand_len from BRANDS
-  union all
-  select
-    brand_canonical_raw as brand_raw,
-    trim(regexp_replace(CANON(alias_norm_raw), '\\s+', ' ')) as brand_norm,
-    length(trim(regexp_replace(CANON(alias_norm_raw), '\\s+', ' '))) as brand_len
-  from ALIASES
-),
-
--- 2) Transactions (ZIP gate + normalization)
-TX as (
-  select
+brand_matching AS (
+  SELECT 
     t.*,
-    ZIP5(t.DAF_MERCH_ZIP_CODE) as zip5,
-    trim(regexp_replace(CANON(t.DAF_MERCH_NAME), '\\s+', ' ')) as merch_norm
-  from "PTX_DB1"."O_RAW"."SCH_RAW_AUTHFILE" t
-  where upper(coalesce(t.DAF_MERCH_STATE_COUNTRY,'')) = 'VA'
-    and (
-      ZIP5(t.DAF_MERCH_ZIP_CODE) in ('22102','22182')
-      or upper(coalesce(t.DAF_MERCH_CITY,'')) like '%TYSON%'
-      or upper(coalesce(t.DAF_MERCH_NAME,'')) like '%TYSON%'
+    b.BRAND_RAW as matched_brand,
+    CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) as cleaned_merchant_name,
+    
+    -- Fuzzy matching with different algorithms
+    EDITDISTANCE(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) as edit_distance,
+    JAROWINKLER_SIMILARITY(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) as jaro_similarity,
+    
+    -- Contains matching (for partial matches)
+    CASE 
+      WHEN CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) = UPPER(b.BRAND_RAW) THEN 100
+      WHEN CONTAINS(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) 
+           OR CONTAINS(UPPER(b.BRAND_RAW), CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME)) THEN 85
+      ELSE 0
+    END as contains_match_score,
+    
+    -- Calculate overall name matching confidence
+    GREATEST(
+      CASE WHEN CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) = UPPER(b.BRAND_RAW) THEN 100 ELSE 0 END,
+      CASE WHEN CONTAINS(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) 
+                OR CONTAINS(UPPER(b.BRAND_RAW), CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME)) THEN 85 ELSE 0 END,
+      ROUND(JAROWINKLER_SIMILARITY(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) * 100, 2),
+      CASE WHEN EDITDISTANCE(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) <= 2 THEN 75 ELSE 0 END
+    ) as name_confidence_score
+    
+  FROM geographic_filter t
+  LEFT JOIN SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brand_directory b
+    ON (
+      -- Direct match
+      CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME) = UPPER(b.BRAND_RAW)
+      -- Contains match
+      OR CONTAINS(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW))
+      OR CONTAINS(UPPER(b.BRAND_RAW), CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME))
+      -- Fuzzy match (Jaro-Winkler similarity > 0.8)
+      OR JAROWINKLER_SIMILARITY(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) > 0.8
+      -- Edit distance <= 3 for reasonable fuzzy matching
+      OR (EDITDISTANCE(CLEAN_MERCHANT_NAME(t.DAF_MERCH_NAME), UPPER(b.BRAND_RAW)) <= 3 
+          AND LENGTH(UPPER(b.BRAND_RAW)) > 4)
     )
 ),
 
--- 3) Single fuzzy pass (plus short-name safeguard)
-CANDIDATES as (
-  select
-    t.*,
-    b.brand_raw,
-    b.brand_norm,
-    JAROWINKLER_SIMILARITY(t.merch_norm, b.brand_norm) as jw,
-    EDITDISTANCE(t.merch_norm, b.brand_norm)           as ed
-  from TX t
-  join BRANDS_EXPANDED b
-    on (
-         JAROWINKLER_SIMILARITY(t.merch_norm, b.brand_norm) >= 0.92
-         or (b.brand_len <= 5 and EDITDISTANCE(t.merch_norm, b.brand_norm) <= 1)
-       )
-),
-
--- 4) Pick the single best brand per transaction (adjust partition key if you have a TXN_ID)
-TOP1 as (
-  select
+final_classification AS (
+  SELECT 
     *,
-    row_number() over (
-      partition by merch_norm, zip5, coalesce(PERIODID,0), coalesce(DAF_AMOUNT,0)
-      order by jw desc, ed asc, length(brand_norm) desc
-    ) as rn
-  from CANDIDATES
+    -- Calculate combined confidence score
+    CASE 
+      WHEN geo_confidence_level = 'HIGH_GEO_CONFIDENCE' AND name_confidence_score >= 75 THEN 95
+      WHEN geo_confidence_level = 'HIGH_GEO_CONFIDENCE' AND name_confidence_score >= 50 THEN 85
+      WHEN geo_confidence_level = 'MEDIUM_GEO_CONFIDENCE' AND name_confidence_score >= 85 THEN 90
+      WHEN geo_confidence_level = 'MEDIUM_GEO_CONFIDENCE' AND name_confidence_score >= 75 THEN 80
+      WHEN geo_confidence_level = 'LOW_GEO_CONFIDENCE' AND name_confidence_score >= 90 THEN 75
+      WHEN name_confidence_score = 100 THEN 70 -- Perfect name match but no geo confirmation
+      ELSE 0
+    END as overall_confidence_score,
+    
+    -- Final classification
+    CASE 
+      WHEN (geo_confidence_level = 'HIGH_GEO_CONFIDENCE' AND name_confidence_score >= 50)
+        OR (geo_confidence_level = 'MEDIUM_GEO_CONFIDENCE' AND name_confidence_score >= 75)
+        OR (geo_confidence_level = 'LOW_GEO_CONFIDENCE' AND name_confidence_score >= 90) THEN 'In TysonsCC'
+      ELSE 'Outside TysonsCC'
+    END as tysons_classification
+  FROM brand_matching
 )
 
--- 5) Final output: top-1 match + confidence; safe UNKNOWN fallback
-select
-  t.PERIODID,
-  t.DAF_MERCH_NAME,
-  t.DAF_MERCH_CITY,
-  t.DAF_MERCH_STATE_COUNTRY,
-  t.DAF_MERCH_ZIP_CODE,
-  t.zip5,
-  t.DAF_AMOUNT,
-  t.merch_norm,
+SELECT 
+  PERIODID,
+  DAF_MERCH_CAT,
+  DAF_MERCH_ZIP_CODE,
+  DAF_MERCH_NAME,
+  DAF_MERCH_CITY,
+  DAF_MERCH_STATE_COUNTRY,
+  DAF_AMOUNT,
+  
+  -- Classification results
+  tysons_classification,
+  overall_confidence_score,
+  
+  -- Debug information
+  cleaned_merchant_name,
+  matched_brand,
+  geo_confidence_level,
+  name_confidence_score,
+  edit_distance,
+  jaro_similarity,
+  contains_match_score
+  
+FROM final_classification
+WHERE overall_confidence_score > 0  -- Only show potential matches
+ORDER BY overall_confidence_score DESC, DAF_AMOUNT DESC;
 
-  coalesce(x.brand_raw, 'UNKNOWN') as matched_brand,
-  x.jw, x.ed,
-  case
-    when x.jw >= 0.96 then 'HIGH'
-    when x.jw >= 0.92 then 'MEDIUM'
-    when x.brand_raw is not null then 'LOW'
-    else 'NONE'
-  end as match_confidence,
-  case when x.brand_raw is null then 1 else 0 end as is_unmatched
-from TX t
-left join TOP1 x
-  on t.merch_norm = x.merch_norm
+-- =====================================================
+-- ALTERNATIVE: SIMPLIFIED VERSION FOR PRODUCTION
+-- =====================================================
+
+-- If you want a simpler, faster query for production use:
+CREATE OR REPLACE VIEW TYSONS_TRANSACTIONS_CLASSIFIED AS
+WITH base_filter AS (
+  SELECT *,
+    UPPER(REGEXP_REPLACE(REGEXP_REPLACE(DAF_MERCH_NAME, '\\s*#\\d+.*$', ''), '[^A-Z0-9\\s&]', '')) as clean_name
+  FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
+  WHERE DAF_MERCH_STATE_COUNTRY = 'VA'
+    AND (LEFT(DAF_MERCH_ZIP_CODE, 5) IN ('22102', '22182')
+         OR DAF_MERCH_CITY IN ('MCLEAN', 'VIENNA', 'TYSONS', 'TYSONS CORNER'))
+)
+
+SELECT 
+  t.*,
+  CASE 
+    WHEN b.BRAND_RAW IS NOT NULL 
+         AND (DAF_MERCH_ZIP_CODE LIKE '22102-%' OR LEFT(DAF_MERCH_ZIP_CODE, 5) = '22102') 
+    THEN 'In TysonsCC'
+    ELSE 'Outside TysonsCC'
+  END as tysons_classification,
+  
+  CASE 
+    WHEN b.BRAND_RAW IS NOT NULL AND DAF_MERCH_ZIP_CODE LIKE '22102-%' THEN 90
+    WHEN b.BRAND_RAW IS NOT NULL AND LEFT(DAF_MERCH_ZIP_CODE, 5) = '22102' THEN 75
+    ELSE 0
+  END as confidence_score
+
+FROM base_filter t
+LEFT JOIN SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brand_directory b
+  ON (t.clean_name LIKE '%' || UPPER(b.BRAND_RAW) || '%' 
+      OR UPPER(b.BRAND_RAW) LIKE '%' || t.clean_name || '%'
+      OR JAROWINKLER_SIMILARITY(t.clean_name, UPPER(b.BRAND_RAW)) > 0.8);
+
+-- =====================================================
+-- VALIDATION QUERIES
+-- =====================================================
+
+-- Check matching effectiveness
+SELECT 
+  tysons_classification,
+  COUNT(*) as transaction_count,
+  COUNT(DISTINCT matched_brand) as unique_brands_matched,
+  AVG(overall_confidence_score) as avg_confidence,
+  SUM(DAF_AMOUNT) as total_amount
+FROM final_classification
+GROUP BY tysons_classification;
+
+-- Review low confidence matches for tuning
+SELECT 
+  DAF_MERCH_NAME,
+  cleaned_merchant_name,
+  matched_brand,
+  geo_confidence_level,
+  name_confidence_score,
+  overall_confidence_score,
+  COUNT(*) as frequency
+FROM final_classification
+WHERE overall_confidence_score BETWEEN 50 AND 75
+GROUP BY 1,2,3,4,5,6
+ORDER BY frequency DESC, overall_confidence_score DESC
+LIMIT 50;
 ```
- and t.zip5       = x.zip5
- and x.rn = 1
-;
