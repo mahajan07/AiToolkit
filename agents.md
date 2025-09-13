@@ -1,197 +1,243 @@
 ```
-/* =============================================================================
-   TYSONS — Map merchants (from trx) to brand list using *existing* embedding tables
-   - Uses VECTOR_COSINE_SIMILARITY (higher = better)
-   - Strict thresholds → weak matches stay NULL
-   - Outputs merchant-level trx_count & total_amount
-   - No session variables; tune knobs in the params CTE
-   ============================================================================= */
+-- ============================
+-- PARAMETERS (tune as needed)
+-- ============================
+SET year_filter           = '2025';
+SET min_sim_strict        = 0.78;  -- accept outright if sim >= this
+SET min_sim_with_hint     = 0.72;  -- accept if sim >= this AND substring hint true
+SET geo_bonus_per_level   = 0.02;  -- geo_confidence_level 0..3 => up to +0.06
+SET substring_bonus       = 0.05;  -- small bump when substring hit
+SET editdistance_cap      = 0.02;  -- max bonus from editdistance ratio
+SET topk_per_merchant     = 5;     -- keep top-K candidates before final pick (perf guard)
 
-WITH
-/* -------------------------------
-   Parameters (tune here)
--------------------------------- */
-params AS (
+-- ============================
+-- INPUTS (reference your embedding tables)
+-- ============================
+WITH brands AS (
   SELECT
-    0.06::FLOAT AS substring_bonus,        -- add if substring hit
-    0.02::FLOAT AS geo_bonus_per_level,    -- * geo_confidence_level (0..3)
-    0.20::FLOAT AS ed_cap,                 -- cap for editdistance contribution (0..1 scale)
-    0.80::FLOAT AS accept_hi,              -- strict accept
-    0.74::FLOAT AS accept_lo,              -- relaxed accept when substring hits
-    '2025'::STRING AS period_yr            -- RAW_AUTHFILE period filter (adjust if needed)
-),
-
-/* -------------------------------
-   Brands — reference your embeddings table
-   Expected columns (adapt if different):
-     BRANDS, LOCATION,
-     cleaned_brand_name,
-     brand_vector, brand_vector_nospace
--------------------------------- */
-brands AS (
-  SELECT
-    BRANDS,
-    LOCATION,
-    cleaned_brand_name                                         AS brand_name_clean,
-    REGEXP_REPLACE(cleaned_brand_name, '\\s+', '')             AS brand_name_nospace,
-    brand_vector,
-    brand_vector_nospace
+      BRANDS                                AS brand_name_raw,
+      clean_for_embedding(BRANDS)           AS brand_name_clean,
+      brand_vector,
+      brand_vector_nospace
   FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_brands_embeddings
 ),
-
-/* -------------------------------
-   Merchants — reference your embeddings table
-   Expected columns (adapt if different):
-     DAF_MERCH_NAME,
-     cleaned_merchant_name,
-     merchant_vector, merchant_vector_nospace,
-     DAF_MERCH_CITY, DAF_MERCH_ZIP_CODE, DAF_MERCH_STATE_COUNTRY,
-     geo_confidence_level (0..3)
--------------------------------- */
 merchants AS (
   SELECT
-    DAF_MERCH_NAME,
-    cleaned_merchant_name                                      AS merch_name_clean,
-    REGEXP_REPLACE(cleaned_merchant_name, '\\s+', '')          AS merch_name_nospace,
-    merchant_vector,
-    merchant_vector_nospace,
-    UPPER(COALESCE(DAF_MERCH_CITY, ''))                        AS DAF_MERCH_CITY,
-    COALESCE(LEFT(DAF_MERCH_ZIP_CODE, 5), '')                  AS ZIP5,
-    DAF_MERCH_STATE_COUNTRY,
-    COALESCE(geo_confidence_level, 0)                          AS geo_confidence_level
+      DAF_MERCH_NAME                         AS merch_name_raw,
+      clean_for_embedding(DAF_MERCH_NAME)    AS merch_name_clean,
+      DAF_MERCH_ZIP_CODE,
+      DAF_MERCH_CITY,
+      DAF_MERCH_STATE_COUNTRY,
+      geo_confidence_level,
+      merchant_vector,
+      merchant_vector_nospace
   FROM SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_merchants_embeddings
 ),
 
-/* -------------------------------
-   Candidate pairs (light blocking)
-   Avoid full cross join; keep recall high.
--------------------------------- */
+-- ============================
+-- TRANSACTION AGGREGATION (merchant-level)
+-- This is the **driving table** so no merchant gets dropped.
+-- ============================
+tx AS (
+  SELECT
+      clean_for_embedding(DAF_MERCH_NAME) AS merch_name_clean,
+      COUNT(*)                            AS trx_count,
+      SUM(DAF_AMOUNT)                     AS total_amount
+  FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
+  WHERE PERIODDATE = $year_filter
+    AND DAF_MERCH_STATE_COUNTRY = 'VA'
+    AND (
+          LEFT(DAF_MERCH_ZIP_CODE,5) IN ('22102','22182')
+          OR UPPER(COALESCE(DAF_MERCH_CITY,'')) IN ('MCLEAN','VIENNA','TYSONS','TYSONS CORNER')
+        )
+  GROUP BY 1
+),
+
+-- ============================
+-- CANDIDATE PAIRS (light blocking to avoid full cross join)
+-- Uses COSINE SIMILARITY (higher = better); also tries “nospace” forms.
+-- ============================
 candidates AS (
   SELECT
-    m.DAF_MERCH_NAME,
-    m.merch_name_clean,
-    m.merch_name_nospace,
-    m.geo_confidence_level,
+      m.*,
+      b.brand_name_raw,
+      b.brand_name_clean,
+      b.brand_vector,
+      b.brand_vector_nospace,
 
-    b.BRANDS,
-    b.LOCATION,
-    b.brand_name_clean,
-    b.brand_name_nospace,
+      -- Vector sims (clamp negatives to 0.0)
+      GREATEST(0.0, VECTOR_COSINE_SIMILARITY(m.merchant_vector,         b.brand_vector        )) AS sim,
+      GREATEST(0.0, VECTOR_COSINE_SIMILARITY(m.merchant_vector_nospace, b.brand_vector_nospace)) AS sim_ns,
 
-    /* base cosine similarities (higher = better) */
-    VECTOR_COSINE_SIMILARITY(m.merchant_vector,         b.brand_vector)         AS sim,
-    VECTOR_COSINE_SIMILARITY(m.merchant_vector_nospace, b.brand_vector_nospace) AS sim_ns,
+      -- String hints (include nospace checks for robustness)
+      (CASE WHEN m.merch_name_clean   LIKE '%' || b.brand_name_clean   || '%'
+              OR b.brand_name_clean   LIKE '%' || m.merch_name_clean   || '%'
+              OR REPLACE(m.merch_name_clean,' ','') LIKE '%' || REPLACE(b.brand_name_clean,' ','') || '%'
+              OR REPLACE(b.brand_name_clean,' ','') LIKE '%' || REPLACE(m.merch_name_clean,' ','') || '%'
+            THEN TRUE ELSE FALSE END) AS substring_hit,
 
-    /* fast string hints (bonuses only) */
-    CASE
-      WHEN m.merch_name_clean   LIKE '%' || b.brand_name_clean   || '%'
-        OR b.brand_name_clean   LIKE '%' || m.merch_name_clean   || '%'
-        OR m.merch_name_nospace LIKE '%' || b.brand_name_nospace || '%'
-        OR b.brand_name_nospace LIKE '%' || m.merch_name_nospace || '%'
-      THEN TRUE ELSE FALSE
-    END AS substring_hit,
+      -- Normalized edit-distance similarity: 0..1
+      LEAST(
+        CASE
+          WHEN GREATEST(LENGTH(m.merch_name_clean), LENGTH(b.brand_name_clean)) = 0 THEN 0
+          ELSE 1.0
+             - (EDITDISTANCE(m.merch_name_clean, b.brand_name_clean)
+                / GREATEST(LENGTH(m.merch_name_clean), LENGTH(b.brand_name_clean)))
+        END,
+        1.0
+      ) AS ed_ratio
 
-    /* normalized edit-distance similarity: 0..1 */
-    CASE
-      WHEN GREATEST(LENGTH(m.merch_name_clean), LENGTH(b.brand_name_clean)) = 0 THEN 0.0
-      ELSE 1.0 - (
-        EDITDISTANCE(m.merch_name_clean, b.brand_name_clean)
-        / GREATEST(LENGTH(m.merch_name_clean), LENGTH(b.brand_name_clean))
-      )
-    END AS ed_ratio
   FROM merchants m
   JOIN brands b
-    ON  SUBSTR(m.merch_name_clean,1,1) = SUBSTR(b.brand_name_clean,1,1)  -- cheap block
-     OR m.merch_name_clean LIKE '%' || b.brand_name_clean || '%'
-     OR b.brand_name_clean LIKE '%' || m.merch_name_clean || '%'
+    ON  -- cheap blocks (any true keeps the pair)
+       LEFT(m.merch_name_clean,1) = LEFT(b.brand_name_clean,1)
+    OR ABS(LENGTH(m.merch_name_clean) - LENGTH(b.brand_name_clean)) <= 8
+    OR m.merch_name_clean LIKE '%' || b.brand_name_clean || '%'
+    OR b.brand_name_clean LIKE '%' || m.merch_name_clean || '%'
 ),
 
-/* -------------------------------
-   Score & choose best brand per merchant
-   - base = max(sim, sim_ns) clamped to 0..1
-   - + bonuses: substring + tiny geo + tiny ed_ratio (capped)
--------------------------------- */
+-- ============================
+-- SCORE + TOP-K per merchant (perf guard)
+-- ============================
 scored AS (
   SELECT
-    c.*,
+      merch_name_raw,
+      merch_name_clean,
+      DAF_MERCH_ZIP_CODE,
+      DAF_MERCH_CITY,
+      DAF_MERCH_STATE_COUNTRY,
+      geo_confidence_level,
 
-    /* clamp negatives and take the stronger of the two similarities */
-    GREATEST(0.0, GREATEST(sim, sim_ns)) AS base_sim,
+      brand_name_raw,
+      brand_name_clean,
 
-    /* composite score: base sim + small bonuses */
-    GREATEST(0.0, GREATEST(sim, sim_ns))
-      + CASE WHEN c.substring_hit THEN p.substring_bonus ELSE 0 END
-      + c.geo_confidence_level * p.geo_bonus_per_level
-      + LEAST(GREATEST(c.ed_ratio, 0.0), p.ed_cap) * 0.20      -- small cap on editdistance influence
-      AS match_score,
+      GREATEST(sim, sim_ns)                                              AS sim_max,
+      substring_hit,
+      ed_ratio,
 
-    ROW_NUMBER() OVER (
-      PARTITION BY c.merch_name_clean
-      ORDER BY
-        GREATEST(0.0, GREATEST(sim, sim_ns)) DESC,
-        c.substring_hit DESC,
-        c.geo_confidence_level DESC,
-        c.ed_ratio DESC
-    ) AS rn
-  FROM candidates c
-  CROSS JOIN params p
+      /* Composite score:
+         base similarity + substring bonus + tiny editdistance bonus + geo bonus
+         - ed_ratio contribution is capped by $editdistance_cap
+      */
+      GREATEST(sim, sim_ns)
+        + (CASE WHEN substring_hit THEN $substring_bonus ELSE 0 END)
+        + LEAST(GREATEST(ed_ratio - 0.80, 0) * $editdistance_cap / 0.20, $editdistance_cap)
+        + (COALESCE(geo_confidence_level,0) * $geo_bonus_per_level)      AS match_score,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY merch_name_clean
+        ORDER BY
+          GREATEST(sim, sim_ns) DESC,
+          substring_hit DESC,
+          ed_ratio DESC
+      ) AS rn_sim_rank
+
+  FROM candidates
+),
+topk AS (
+  SELECT *
+  FROM scored
+  WHERE rn_sim_rank <= $topk_per_merchant
 ),
 
-best_brand_per_merchant AS (
+-- ============================
+-- CHOOSE TOP-1 + APPLY ACCEPTANCE RULES
+-- ============================
+picked AS (
   SELECT
-    merch_name_clean,
-    /* keep brand only if it's strong; else NULL */
-    CASE
-      WHEN match_score >= p.accept_hi
-        OR (match_score >= p.accept_lo AND substring_hit)
-      THEN brand_name_clean
-      ELSE NULL
-    END AS mapped_brand,
-    match_score,
-    substring_hit,
-    geo_confidence_level
-  FROM scored
-  CROSS JOIN params p
+      merch_name_raw,
+      merch_name_clean,
+      DAF_MERCH_ZIP_CODE,
+      DAF_MERCH_CITY,
+      DAF_MERCH_STATE_COUNTRY,
+      geo_confidence_level,
+
+      brand_name_raw,
+      brand_name_clean,
+      sim_max,
+      substring_hit,
+      ed_ratio,
+      match_score,
+
+      ROW_NUMBER() OVER (
+        PARTITION BY merch_name_clean
+        ORDER BY match_score DESC, sim_max DESC
+      ) AS rn
+  FROM topk
+),
+final_map AS (
+  SELECT
+      merch_name_clean,
+      /* keep brand NULL unless rules pass */
+      CASE
+        WHEN sim_max >= $min_sim_strict THEN brand_name_raw
+        WHEN sim_max >= $min_sim_with_hint AND substring_hit THEN brand_name_raw
+        WHEN match_score >= ($min_sim_strict + 0.02) THEN brand_name_raw
+        ELSE NULL
+      END AS mapped_brand,
+      sim_max,
+      match_score,
+      substring_hit,
+      ed_ratio,
+      geo_confidence_level
+  FROM picked
   WHERE rn = 1
 ),
 
-/* -------------------------------
-   Aggregate transactions for the same area/time window
-   - Clean the merchant name the same way so the join aligns
-   - Keep your Tysons/VA filters and 5+4 → ZIP5 handling
--------------------------------- */
-tx_base AS (
-  SELECT *
-  FROM PTX_DB.L0_RAW_SCH.RAW_AUTHFILE
-  WHERE DAF_MERCH_STATE_COUNTRY = 'VA'
-    AND (
-      LEFT(COALESCE(DAF_MERCH_ZIP_CODE,''), 5) IN ('22102','22182')
-      OR UPPER(COALESCE(DAF_MERCH_CITY,'')) IN ('MCLEAN','VIENNA','TYSONS','TYSONS CORNER')
-    )
-    AND PERIODDATE = (SELECT period_yr FROM params)
-),
-trx_agg AS (
+-- ============================
+-- MERCHANT-LEVEL OUTPUT (DRIVEN BY TRANSACTIONS)
+-- Start from ALL trx merchants, left join mapping → nothing is dropped.
+-- ============================
+merchant_rollup AS (
   SELECT
-    clean_for_embedding(DAF_MERCH_NAME) AS merch_name_clean,
-    COUNT(*)                            AS trx_count,
-    SUM(DAF_AMOUNT)                     AS total_amount
-  FROM tx_base
-  GROUP BY 1
+      t.merch_name_clean,
+      -- pull a sample name/city/zip/state from merchant embeddings when available
+      ANY_VALUE(m.merch_name_raw)              AS merchant_name_example,
+      ANY_VALUE(m.DAF_MERCH_CITY)              AS sample_city,
+      ANY_VALUE(m.DAF_MERCH_ZIP_CODE)          AS sample_zip,
+      ANY_VALUE(m.DAF_MERCH_STATE_COUNTRY)     AS sample_state,
+
+      COALESCE(f.mapped_brand, NULL)           AS mapped_brand,
+      f.sim_max,
+      f.match_score,
+      f.substring_hit,
+      f.ed_ratio,
+      f.geo_confidence_level,
+
+      t.trx_count,
+      t.total_amount,
+
+      CASE WHEN f.mapped_brand IS NOT NULL THEN 'MATCHED' ELSE 'UNMATCHED' END AS match_status
+  FROM tx t
+  LEFT JOIN final_map f
+    ON f.merch_name_clean = t.merch_name_clean
+  LEFT JOIN merchants m
+    ON m.merch_name_clean = t.merch_name_clean
 )
 
-/* -------------------------------
-   FINAL — merchant level with nullable mapped brand
--------------------------------- */
+-- ============================
+-- MATERIALIZE RESULT
+-- ============================
+CREATE OR REPLACE TABLE
+  SBOX_CONSUMERBANKING_BI.DEPOSITS_CARDS_CHNL_PROD.tysons_merchant_brand_map_2025
+AS
 SELECT
-  a.merch_name_clean,
-  m.mapped_brand,                 -- NULL when not strong enough
-  m.match_score,
-  m.substring_hit,
-  COALESCE(m.geo_confidence_level, 0) AS geo_confidence_level,
-  a.trx_count,
-  a.total_amount
-FROM trx_agg a
-LEFT JOIN best_brand_per_merchant m
-  ON a.merch_name_clean = m.merch_name_clean
-ORDER BY a.trx_count DESC, a.total_amount DESC;
+  merch_name_clean                         AS merchant_key,
+  merchant_name_example,
+  sample_city,
+  sample_zip,
+  sample_state,
+
+  mapped_brand,                            -- NULL when weak/unclear
+  sim_max,
+  match_score,
+  substring_hit,
+  ed_ratio,
+  geo_confidence_level,
+
+  trx_count,
+  total_amount,
+  match_status
+FROM merchant_rollup
+;
 ```
